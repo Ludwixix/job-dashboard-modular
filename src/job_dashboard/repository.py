@@ -29,6 +29,14 @@ class JobRepository:
                 from_status TEXT, to_status TEXT NOT NULL, occurred_at TEXT NOT NULL,
                 FOREIGN KEY(job_id) REFERENCES jobs(id)
             );
+            CREATE TABLE IF NOT EXISTS scrape_runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                site TEXT NOT NULL,
+                started_at TEXT NOT NULL,
+                finished_at TEXT NOT NULL,
+                listings_found INTEGER NOT NULL DEFAULT 0,
+                errors_json TEXT NOT NULL DEFAULT '[]'
+            );
         """)
         self.connection.commit()
 
@@ -81,3 +89,87 @@ class JobRepository:
         counts.update({row["status"]: row["count"] for row in rows})
         total = sum(counts.values())
         return {"total": total, "by_status": counts, "events": self.connection.execute("SELECT COUNT(*) FROM application_events").fetchone()[0]}
+
+    def log_scrape_run(
+        self,
+        site: str,
+        started_at: str,
+        finished_at: str,
+        listings_found: int,
+        errors: list[str] | None = None,
+    ) -> dict[str, Any]:
+        payload = {
+            "site": str(site).strip(),
+            "started_at": str(started_at),
+            "finished_at": str(finished_at),
+            "listings_found": max(0, int(listings_found)),
+            "errors_json": json.dumps(
+                [str(error).strip() for error in (errors or []) if str(error).strip()],
+                ensure_ascii=False,
+            ),
+        }
+        with self.connection:
+            cursor = self.connection.execute("""
+                INSERT INTO scrape_runs (site, started_at, finished_at, listings_found, errors_json)
+                VALUES (:site, :started_at, :finished_at, :listings_found, :errors_json)
+            """, payload)
+        return {
+            "id": cursor.lastrowid,
+            "site": payload["site"],
+            "started_at": payload["started_at"],
+            "finished_at": payload["finished_at"],
+            "listings_found": payload["listings_found"],
+            "errors": json.loads(payload["errors_json"]),
+        }
+
+    def get_scrape_runs(self, *, site="", limit=20) -> list[dict[str, Any]]:
+        """Return the most recent scrape runs up to `limit` with optional site filtering.
+
+        Matching is case-insensitive and substring-based. Literal `%` and `_` characters in
+        `site` are escaped, and `limit` is clamped to 1+.
+        """
+        clauses = []
+        values: list[Any] = []
+        if site:
+            clauses.append("lower(site) LIKE lower(?) ESCAPE '!'")
+            escaped_site = str(site).replace("!", "!!").replace("%", "!%").replace("_", "!_")
+            values.append(f"%{escaped_site}%")
+        query = "SELECT id, site, started_at, finished_at, listings_found, errors_json FROM scrape_runs"
+        if clauses:
+            query += f" WHERE {' AND '.join(clauses)}"
+        query += " ORDER BY started_at DESC, id DESC LIMIT ?"
+        values.append(max(1, int(limit)))
+        rows = self.connection.execute(query, values).fetchall()
+        return [
+            {
+                "id": row["id"],
+                "site": row["site"],
+                "started_at": row["started_at"],
+                "finished_at": row["finished_at"],
+                "listings_found": row["listings_found"],
+                "errors": json.loads(row["errors_json"]),
+            }
+            for row in rows
+        ]
+
+    def get_scrape_run_summary(self) -> dict[str, Any]:
+        rows = self.connection.execute("""
+            SELECT site, COUNT(*) AS runs, SUM(listings_found) AS listings_found,
+                   SUM(CASE WHEN COALESCE(json_array_length(errors_json), 0) > 0 THEN 1 ELSE 0 END) AS errors
+            FROM scrape_runs
+            GROUP BY site
+        """).fetchall()
+        by_site = {
+            row["site"]: {
+                "runs": row["runs"],
+                "listings_found": row["listings_found"],
+                "errors": row["errors"],
+            }
+            for row in rows
+        }
+        return {
+            "runs": sum(item["runs"] for item in by_site.values()),
+            "listings_found": sum(item["listings_found"] for item in by_site.values()),
+            "errors": sum(item["errors"] for item in by_site.values()),
+            "by_site": by_site,
+        }
